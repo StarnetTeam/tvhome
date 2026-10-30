@@ -13,7 +13,7 @@ import java.util.Set;
 
 /** Every setting lives here. Plain SharedPreferences, no libraries. */
 final class Prefs {
-    static final String[] CARD_IDS = {"weather", "prayer", "matches", "clock", "storage", "network", "standby"};
+    static final String[] CARD_IDS = {"weather", "prayer", "matches", "clock", "storage", "network", "standby", "remote"};
 
     private Prefs() {}
 
@@ -25,7 +25,7 @@ final class Prefs {
     static String lang(Context c) { return sp(c).getString("lang", "system"); }
     static void lang(Context c, String v) { sp(c).edit().putString("lang", v).apply(); }
 
-    static int theme(Context c) { return sp(c).getInt("theme", 0); }
+    static int theme(Context c) { return sp(c).getInt("theme", 4); }
     static void theme(Context c, int v) { sp(c).edit().putInt("theme", v).apply(); }
 
     /** -1 = automatic (on for weak devices), 0 = off, 1 = on. */
@@ -73,14 +73,26 @@ final class Prefs {
     static Set<String> hidden(Context c) { return new HashSet<>(sp(c).getStringSet("hidden", new HashSet<String>())); }
     static void hidden(Context c, Set<String> v) { sp(c).edit().putStringSet("hidden", v).apply(); }
 
-    static List<String> dock(Context c) {
-        String s = sp(c).getString("dock", "");
+    /** The user's order of apps (package names). Empty = the default order. */
+    static List<String> order(Context c) {
+        String s = sp(c).getString("order", "");
         return s.isEmpty() ? new ArrayList<String>() : new ArrayList<>(Arrays.asList(s.split(",")));
     }
-    static void dock(Context c, List<String> v) { sp(c).edit().putString("dock", TextUtils.join(",", v)).apply(); }
+    static void order(Context c, List<String> v) { sp(c).edit().putString("order", TextUtils.join(",", v)).apply(); }
 
-    static int cols(Context c) { return sp(c).getInt("cols", 5); }
+    /** Apps per row: 0 = the theme's own number, otherwise 4 to 7. */
+    static int cols(Context c) { return sp(c).getInt("cols", 0); }
     static void cols(Context c, int v) { sp(c).edit().putInt("cols", v).apply(); }
+
+    static boolean wallpaper(Context c) { return sp(c).getBoolean("wallpaper", true); }
+    static void wallpaper(Context c, boolean v) { sp(c).edit().putBoolean("wallpaper", v).apply(); }
+
+    static boolean tileMenu(Context c) { return sp(c).getBoolean("tileMenu", true); }
+    static void tileMenu(Context c, boolean v) { sp(c).edit().putBoolean("tileMenu", v).apply(); }
+
+    /** True when cards sit above the dock. */
+    static boolean showCards(Context c) { return sp(c).getBoolean("showCards", true); }
+    static void showCards(Context c, boolean v) { sp(c).edit().putBoolean("showCards", v).apply(); }
 
     /** Bumped by Settings whenever the app list or dock changes, so Home reloads it. */
     static long appsRev(Context c) { return sp(c).getLong("appsRev", 0L); }

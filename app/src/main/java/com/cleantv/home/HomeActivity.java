@@ -6,15 +6,25 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Outline;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.media.tv.TvContract;
+import android.media.tv.TvInputInfo;
+import android.media.tv.TvInputManager;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.text.format.DateFormat;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
@@ -32,33 +42,46 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
 /**
- * The home screen: greeting and clock, a row of live info cards, then the dock and the grid of
- * all apps. Everything is built in code and works with the D-pad only.
+ * The home screen, built to match the preview: wallpaper, greeting and clock, glass buttons with
+ * icons, a row of live cards, then the dock and the app grid. D-pad only. Hold OK on an app for
+ * its menu (move, clear data, uninstall, hide).
  */
 public final class HomeActivity extends Activity {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, CardTile> tiles = new HashMap<>();
+    private final Map<String, View> tileByPkg = new HashMap<>();
     private final CardRepo.Listener cardListener = k -> {
         CardTile t = tiles.get(k.id);
         if (t != null) t.bind(k);
     };
 
-    private LinearLayout cardsRow, dockRow, gridBox;
+    private Themes.T theme;
+    private ImageView wpView;
+    private View dimView, shadeView, glowView;
+    private GradientDrawable glow;
+    private LinearLayout cardsRow, dockRow, gridBox, wifiPill;
     private HorizontalScrollView cardsScroll;
-    private TextView greetView, clockView, dateView, nameView;
-    private String shownLang = "", shownCards = "";
-    private int shownTheme, shownCols;
+    private TextView greetView, clockView, ampmView, dateView, nameView, capView;
+    private String signature = "";
     private long shownAppsRev = -1L;
+    private int shownWp;
     private boolean reduce, resumed, loadingApps, packagesChanged;
+
+    private List<Apps.Item> visibleOrdered = new ArrayList<>();
+    private List<Apps.Item> allItems = new ArrayList<>();
+    private String movingPkg;
+    private int dockCount = 4, cols = 4;
 
     private final Runnable tick = new Runnable() {
         @Override public void run() {
             updateClock();
+            applyWallpaper();
             refreshCards();
             handler.postDelayed(this, 30_000L);
         }
@@ -81,12 +104,17 @@ public final class HomeActivity extends Activity {
         super.onCreate(b);
         Ui.init(this);
         reduce = Prefs.reduce(this);
-        shownLang = Prefs.lang(this);
-        shownTheme = Prefs.theme(this);
-        shownCols = Prefs.cols(this);
+        theme = Themes.current(this);
+        signature = signature();
         if (reduce) getWindow().setWindowAnimations(0);
         buildUi();
         buildCards();
+    }
+
+    /** Everything that changes the look of Home; when it changes the screen is rebuilt. */
+    private String signature() {
+        return Prefs.lang(this) + "|" + Prefs.theme(this) + "|" + Prefs.cols(this) + "|" + Prefs.wallpaper(this)
+                + "|" + Prefs.showCards(this) + "|" + Prefs.cards(this) + "|" + Prefs.reduce(this);
     }
 
     @Override
@@ -108,16 +136,13 @@ public final class HomeActivity extends Activity {
     protected void onResume() {
         super.onResume();
         resumed = true;
-        if (!shownLang.equals(Prefs.lang(this)) || shownTheme != Prefs.theme(this) || reduce != Prefs.reduce(this)) {
+        if (!signature.equals(signature())) {
             recreate();
             return;
         }
         updateClock();
-        if (!shownCards.equals(Prefs.cards(this).toString())) buildCards();
-        if (packagesChanged || shownAppsRev != Prefs.appsRev(this) || shownCols != Prefs.cols(this)) {
-            shownCols = Prefs.cols(this);
-            loadApps();
-        }
+        applyWallpaper();
+        if (packagesChanged || shownAppsRev != Prefs.appsRev(this) || visibleOrdered.isEmpty()) loadApps();
         handler.removeCallbacks(tick);
         handler.post(tick);
     }
@@ -132,7 +157,6 @@ public final class HomeActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        // Home pressed while already here: jump back to the first app of the dock
         if (dockRow != null && dockRow.getChildCount() > 0) dockRow.getChildAt(0).requestFocus();
     }
 
@@ -141,11 +165,62 @@ public final class HomeActivity extends Activity {
         // a launcher has nowhere to go back to
     }
 
-    // ---- building the screen ------------------------------------------------------------
+    /** While an app is being moved, the arrows move it and OK or Back drops it. */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent e) {
+        if (movingPkg != null) {
+            if (e.getAction() == KeyEvent.ACTION_DOWN) {
+                boolean rtl = getResources().getConfiguration().getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
+                switch (e.getKeyCode()) {
+                    case KeyEvent.KEYCODE_DPAD_LEFT: moveApp(rtl ? 1 : -1, 0); break;
+                    case KeyEvent.KEYCODE_DPAD_RIGHT: moveApp(rtl ? -1 : 1, 0); break;
+                    case KeyEvent.KEYCODE_DPAD_UP: moveApp(0, -1); break;
+                    case KeyEvent.KEYCODE_DPAD_DOWN: moveApp(0, 1); break;
+                    case KeyEvent.KEYCODE_DPAD_CENTER:
+                    case KeyEvent.KEYCODE_ENTER:
+                    case KeyEvent.KEYCODE_BACK:
+                        movingPkg = null;
+                        Toast.makeText(this, R.string.move_done, Toast.LENGTH_SHORT).show();
+                        break;
+                    default: break;
+                }
+            }
+            return true;
+        }
+        return super.dispatchKeyEvent(e);
+    }
+
+    // ---- building the screen --------------------------------------------------------------
 
     private void buildUi() {
         FrameLayout root = new FrameLayout(this);
-        root.setBackground(Themes.background(this));
+        root.setBackgroundColor(theme.bg);
+
+        wpView = new ImageView(this);
+        wpView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        wpView.setVisibility(View.GONE);
+        root.addView(wpView, matchParent());
+
+        dimView = new View(this);
+        dimView.setBackgroundColor(Color.argb(theme.dim * 255 / 100, 0, 0, 0));
+        root.addView(dimView, matchParent());
+
+        shadeView = new View(this);
+        shadeView.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
+                new int[]{Color.argb(140, 0, 0, 0), 0}));
+        shadeView.setVisibility(View.GONE);
+        root.addView(shadeView, matchParent());
+
+        glowView = new View(this);
+        glow = new GradientDrawable();
+        glow.setGradientType(GradientDrawable.RADIAL_GRADIENT);
+        int w = getResources().getDisplayMetrics().widthPixels;
+        glow.setGradientRadius(w * (theme.horizon ? 0.62f : 0.55f));
+        glow.setGradientCenter(theme.horizon ? 0.5f : 0.34f, theme.horizon ? 0f : 0.52f);
+        glow.setColors(new int[]{theme.accent, 0});
+        glowView.setBackground(glow);
+        glowView.setVisibility(theme.ambient && !reduce ? View.VISIBLE : View.GONE);
+        root.addView(glowView, matchParent());
 
         ScrollView scroll = new ScrollView(this);
         scroll.setVerticalScrollBarEnabled(false);
@@ -153,24 +228,34 @@ public final class HomeActivity extends Activity {
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setClipChildren(false);
-        content.setPadding(Ui.u(5f), Ui.u(3.4f), Ui.u(5f), Ui.u(4f));
+        content.setPadding(Ui.u(5f), Ui.u(3.6f), Ui.u(5f), Ui.u(4f));
 
-        // header: greeting and clock on one side, quick buttons on the other
+        // ---- header: greeting + clock, glass buttons, wallpaper caption
         FrameLayout header = new FrameLayout(this);
         LinearLayout left = new LinearLayout(this);
         left.setOrientation(LinearLayout.VERTICAL);
-        greetView = Ui.text(this, "", 1.25f, Color.argb(210, 255, 255, 255));
+        boolean arabic = LocaleHelper.isArabic(this);
+        greetView = Ui.text(this, "", 1.25f, Color.argb(205, 255, 255, 255));
+        greetView.setAllCaps(true);
+        if (!arabic) greetView.setLetterSpacing(0.2f);
         clockView = Ui.text(this, "", 4.6f, Color.WHITE);
         clockView.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
-        dateView = Ui.text(this, "", 1.3f, Color.argb(220, 255, 255, 255));
+        ampmView = Ui.text(this, "", 1.25f, Color.argb(205, 255, 255, 255));
+        ampmView.setAllCaps(true);
+        dateView = Ui.text(this, "", 1.25f, Color.argb(215, 255, 255, 255));
+        dateView.setAllCaps(true);
+        if (!arabic) dateView.setLetterSpacing(0.18f);
         LinearLayout timeRow = new LinearLayout(this);
         timeRow.setOrientation(LinearLayout.HORIZONTAL);
         timeRow.setGravity(Gravity.CENTER_VERTICAL);
         timeRow.addView(clockView);
-        LinearLayout.LayoutParams dateLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        dateLp.setMarginStart(Ui.u(1.6f));
-        timeRow.addView(dateView, dateLp);
+        timeRow.addView(ampmView, marginStart(Ui.u(1.2f)));
+        View divider = new View(this);
+        divider.setBackgroundColor(Color.argb(80, 255, 255, 255));
+        LinearLayout.LayoutParams dv = new LinearLayout.LayoutParams(Math.max(1, Ui.u(0.1f)), Ui.u(3f));
+        dv.setMarginStart(Ui.u(1.6f));
+        timeRow.addView(divider, dv);
+        timeRow.addView(dateView, marginStart(Ui.u(1.6f)));
         left.addView(greetView);
         left.addView(timeRow);
         header.addView(left, new FrameLayout.LayoutParams(
@@ -178,15 +263,28 @@ public final class HomeActivity extends Activity {
 
         LinearLayout pills = new LinearLayout(this);
         pills.setOrientation(LinearLayout.HORIZONTAL);
-        addPill(pills, R.string.pill_network, () -> open(new Intent(Settings.ACTION_WIFI_SETTINGS)));
-        addPill(pills, R.string.pill_system, () -> open(new Intent(Settings.ACTION_SETTINGS)));
-        addPill(pills, R.string.pill_settings, () -> open(new Intent(this, SettingsActivity.class)));
-        header.addView(pills, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.TOP));
-        content.addView(header, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout inputs = Ui.iconPill(this, R.drawable.ic_input, getString(R.string.pill_inputs), theme.icons, reduce, this::showInputs);
+        wifiPill = Ui.iconPill(this, R.drawable.ic_wifi, getString(R.string.net_wifi), theme.icons, reduce,
+                () -> open(new Intent(Settings.ACTION_WIFI_SETTINGS)));
+        LinearLayout settings = Ui.iconPill(this, R.drawable.ic_gear, getString(R.string.pill_settings), theme.icons, reduce,
+                () -> open(new Intent(this, SettingsActivity.class)));
+        pills.addView(inputs);
+        pills.addView(wifiPill, marginStart(Ui.u(0.9f)));
+        pills.addView(settings, marginStart(Ui.u(0.9f)));
+        FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.TOP);
+        pl.topMargin = Ui.u(0.4f);
+        header.addView(pills, pl);
 
-        // live info cards
+        capView = Ui.text(this, "", 1.05f, Color.argb(220, 255, 255, 255));
+        capView.setShadowLayer(3f, 0f, 1f, Color.BLACK);
+        FrameLayout.LayoutParams cl = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.TOP);
+        cl.topMargin = Ui.u(5.2f);
+        header.addView(capView, cl);
+        content.addView(header, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.u(11.4f)));
+
+        // ---- live cards: always the same strip under the clock
         cardsScroll = new HorizontalScrollView(this);
         cardsScroll.setHorizontalScrollBarEnabled(false);
         cardsScroll.setClipToPadding(false);
@@ -194,29 +292,29 @@ public final class HomeActivity extends Activity {
         cardsRow = new LinearLayout(this);
         cardsRow.setOrientation(LinearLayout.HORIZONTAL);
         cardsRow.setClipChildren(false);
-        cardsRow.setPadding(Ui.u(0.8f), Ui.u(0.8f), Ui.u(0.8f), Ui.u(0.8f));
+        cardsRow.setPadding(Ui.u(0.6f), Ui.u(0.6f), Ui.u(0.6f), Ui.u(0.6f));
         cardsScroll.addView(cardsRow);
-        LinearLayout.LayoutParams cardsLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        cardsLp.topMargin = Ui.u(1.2f);
-        content.addView(cardsScroll, cardsLp);
+        content.addView(cardsScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.u(11.8f)));
 
-        // name of the focused app or card
-        nameView = Ui.text(this, "", 2.5f, Color.WHITE);
-        nameView.setMinHeight(Ui.u(3.6f));
+        // ---- name of the focused app or card
+        nameView = Ui.text(this, "", theme.cine ? 3.1f : 2.5f, Color.WHITE);
+        nameView.setShadowLayer(8f, 0f, 1f, Color.argb(130, 0, 0, 0));
+        nameView.setGravity(Gravity.CENTER_VERTICAL);
         Ui.oneLine(nameView);
-        LinearLayout.LayoutParams nameLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        nameLp.topMargin = Ui.u(0.6f);
-        nameLp.bottomMargin = Ui.u(0.6f);
-        content.addView(nameView, nameLp);
+        nameView.setVisibility(theme.title ? View.VISIBLE : View.INVISIBLE);
+        content.addView(nameView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.u(4.2f)));
 
-        // dock band and the rest of the apps
+        // ---- dock and grid
         dockRow = new LinearLayout(this);
         dockRow.setOrientation(LinearLayout.HORIZONTAL);
         dockRow.setClipChildren(false);
         dockRow.setPadding(Ui.u(0.9f), Ui.u(0.9f), Ui.u(0.9f), Ui.u(0.9f));
-        dockRow.setBackground(Ui.solid(Color.argb(125, 14, 16, 24), 2f));
+        if (theme.band) {
+            int alpha = Math.round(theme.dop / 100f * 0.62f * 255f);
+            dockRow.setBackground(theme.glass
+                    ? Ui.shape(Color.argb(alpha, 14, 16, 24), 2f, Color.argb(56, 255, 255, 255), 0.1f)
+                    : Ui.solid(Color.argb(alpha, 14, 16, 24), 2f));
+        }
         LinearLayout.LayoutParams dockLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         dockLp.setMarginStart(-Ui.u(0.9f));
@@ -227,69 +325,142 @@ public final class HomeActivity extends Activity {
         gridBox = new LinearLayout(this);
         gridBox.setOrientation(LinearLayout.VERTICAL);
         gridBox.setClipChildren(false);
+        gridBox.setAlpha(theme.fade ? 0.8f : 1f);
         content.addView(gridBox, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         scroll.addView(content);
-        root.addView(scroll, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        root.addView(scroll, matchParent());
         setContentView(root);
     }
 
-    private void addPill(LinearLayout row, int label, Runnable action) {
-        TextView p = Ui.pill(this, getString(label), 1.3f, reduce, action);
+    private static FrameLayout.LayoutParams matchParent() {
+        return new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+    }
+
+    private static LinearLayout.LayoutParams marginStart(int px) {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.setMarginStart(Ui.u(0.9f));
-        row.addView(p, lp);
+        lp.setMarginStart(px);
+        return lp;
     }
 
     private void updateClock() {
         boolean h24 = DateFormat.is24HourFormat(this);
-        java.util.Locale loc = LocaleHelper.numLocale(this);
+        Locale loc = LocaleHelper.numLocale(this);
         LocalTime now = LocalTime.now();
-        clockView.setText(now.format(DateTimeFormatter.ofPattern(h24 ? "HH:mm" : "h:mm a", loc)));
+        clockView.setText(now.format(DateTimeFormatter.ofPattern(h24 ? "HH:mm" : "h:mm", loc)));
+        ampmView.setText(h24 ? "" : now.format(DateTimeFormatter.ofPattern("a", loc)));
         dateView.setText(LocalDate.now().format(DateTimeFormatter.ofPattern("EEEE d MMMM", loc)));
         int hour = now.getHour();
         greetView.setText(hour < 12 ? R.string.greet_morning : hour < 18 ? R.string.greet_afternoon : R.string.greet_evening);
+        updateNetPill();
+    }
+
+    /** The Wi-Fi button shows the real connection: Wi-Fi, Ethernet or offline. */
+    private void updateNetPill() {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        NetworkInfo ni = cm == null ? null : cm.getActiveNetworkInfo();
+        boolean on = ni != null && ni.isConnected();
+        boolean eth = on && ni.getType() == ConnectivityManager.TYPE_ETHERNET;
+        ((ImageView) wifiPill.getChildAt(0)).setImageResource(eth ? R.drawable.ic_lan : R.drawable.ic_wifi);
+        wifiPill.getChildAt(0).setAlpha(on ? 1f : 0.45f);
+        if (wifiPill.getChildCount() > 1) {
+            ((TextView) wifiPill.getChildAt(1)).setText(!on ? R.string.net_off : eth ? R.string.net_eth : R.string.net_wifi);
+        }
+    }
+
+    private void applyWallpaper() {
+        final Wallpapers.Pick p = Wallpapers.current(this, theme);
+        capView.setText(p != null && p.caption != null ? p.caption : "");
+        final int res = p == null ? 0 : p.res;
+        if (res == shownWp) return;
+        shownWp = res;
+        shadeView.setVisibility(p == null ? View.GONE : View.VISIBLE);
+        if (p == null) {
+            wpView.setImageDrawable(null);
+            wpView.setVisibility(View.GONE);
+            return;
+        }
+        new Thread(() -> {
+            final Bitmap bm = Wallpapers.decode(HomeActivity.this, res);
+            runOnUiThread(() -> {
+                if (res == shownWp && bm != null) {
+                    wpView.setImageBitmap(bm);
+                    wpView.setVisibility(View.VISIBLE);
+                }
+            });
+        }).start();
+    }
+
+    private void setGlow(int color) {
+        if (glow == null || glowView.getVisibility() != View.VISIBLE) return;
+        glow.setColors(new int[]{color, 0});
+        glowView.invalidate();
+        glowView.setAlpha(wpView.getVisibility() == View.VISIBLE ? 0.4f : 0.55f);
     }
 
     private void open(Intent i) {
         try {
             startActivity(i);
+            if (reduce) overridePendingTransition(0, 0);
         } catch (ActivityNotFoundException e) {
             Toast.makeText(this, R.string.cannot_open, Toast.LENGTH_SHORT).show();
         }
     }
 
-    // ---- cards --------------------------------------------------------------------------
+    // ---- inputs (HDMI and other pass-through sources) ---------------------------------------
+
+    private void showInputs() {
+        try {
+            TvInputManager m = (TvInputManager) getSystemService(Context.TV_INPUT_SERVICE);
+            final List<TvInputInfo> inputs = new ArrayList<>();
+            if (m != null) {
+                for (TvInputInfo i : m.getTvInputList()) if (i.isPassthroughInput()) inputs.add(i);
+            }
+            if (inputs.isEmpty()) {
+                Toast.makeText(this, R.string.no_inputs, Toast.LENGTH_LONG).show();
+                return;
+            }
+            String[] labels = new String[inputs.size()];
+            for (int i = 0; i < labels.length; i++) labels[i] = String.valueOf(inputs.get(i).loadLabel(this));
+            Dialogs.menu(this, getString(R.string.pill_inputs), labels, which ->
+                    open(new Intent(Intent.ACTION_VIEW, TvContract.buildChannelUriForPassthroughInput(inputs.get(which).getId()))));
+        } catch (RuntimeException e) {
+            Toast.makeText(this, R.string.no_inputs, Toast.LENGTH_LONG).show();
+        }
+    }
+
+    // ---- cards ------------------------------------------------------------------------------
 
     private void buildCards() {
         cardsRow.removeAllViews();
         tiles.clear();
         Set<String> on = Prefs.cards(this);
-        for (final String id : Prefs.CARD_IDS) {
-            if (!on.contains(id)) continue;
-            final Source s = CardRepo.byId(id);
-            CardTile t = new CardTile(this, s.accent());
-            t.title.setText(s.titleRes());
-            t.big.setText("\u2026");
-            t.setOnFocusChangeListener((v, focused) -> {
-                Ui.focusAnim(v, focused, reduce);
-                if (focused) nameView.setText(s.titleRes());
-            });
-            t.setOnClickListener(v -> {
-                Intent i = id.equals("matches") ? new Intent(this, MatchesActivity.class)
-                        : new Intent(this, CardDetailActivity.class).putExtra("id", id);
-                open(i);
-            });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(Ui.u(27.5f), Ui.u(10.6f));
-            lp.setMarginEnd(Ui.u(1.5f));
-            cardsRow.addView(t, lp);
-            tiles.put(id, t);
+        if (Prefs.showCards(this)) {
+            for (final String id : Prefs.CARD_IDS) {
+                if (!on.contains(id)) continue;
+                final Source s = CardRepo.byId(id);
+                CardTile t = new CardTile(this, s.accent());
+                t.title.setText(s.titleRes());
+                t.big.setText("\u2026");
+                t.setOnFocusChangeListener((v, focused) -> {
+                    Ui.focusAnim(v, focused, reduce, 1.03f);
+                    if (focused) {
+                        nameView.setText(s.titleRes());
+                        setGlow(s.accent());
+                    }
+                });
+                t.setOnClickListener(v -> open(id.equals("matches") ? new Intent(this, MatchesActivity.class)
+                        : new Intent(this, CardDetailActivity.class).putExtra("id", id)));
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(Ui.u(27.5f), Ui.u(10.6f));
+                lp.setMarginEnd(Ui.u(1.5f));
+                cardsRow.addView(t, lp);
+                tiles.put(id, t);
+            }
         }
-        cardsScroll.setVisibility(tiles.isEmpty() ? View.GONE : View.VISIBLE);
-        shownCards = on.toString();
+        // keep the strip's space even with no cards, so the dock never jumps
+        cardsScroll.setVisibility(tiles.isEmpty() ? View.INVISIBLE : View.VISIBLE);
         refreshCards();
     }
 
@@ -311,7 +482,7 @@ public final class HomeActivity extends Activity {
             setFocusable(true);
             setClickable(true);
             setClipChildren(true);
-            setBackground(Ui.focusBg(Color.argb(165, 12, 16, 26), 1.4f));
+            setBackground(Ui.focusBg(Color.argb(133, 12, 14, 22), 1.4f));
 
             View strip = new View(c);
             strip.setBackgroundColor(accent);
@@ -321,11 +492,11 @@ public final class HomeActivity extends Activity {
             box.setPadding(Ui.u(1.3f), Ui.u(0.9f), Ui.u(1.3f), Ui.u(0.9f));
             LinearLayout col = new LinearLayout(c);
             col.setOrientation(VERTICAL);
-            title = Ui.text(c, "", 1.2f, Color.argb(200, 255, 255, 255));
+            title = Ui.text(c, "", 1.2f, Color.argb(190, 255, 255, 255));
             big = Ui.text(c, "", 3.0f, Color.WHITE);
             big.setTypeface(Typeface.create("sans-serif-light", Typeface.NORMAL));
             sub = Ui.text(c, "", 1.25f, Color.WHITE);
-            detail = Ui.text(c, "", 1.05f, Color.argb(170, 255, 255, 255));
+            detail = Ui.text(c, "", 1.05f, Color.argb(165, 255, 255, 255));
             Ui.oneLine(title);
             Ui.oneLine(big);
             Ui.oneLine(sub);
@@ -347,8 +518,10 @@ public final class HomeActivity extends Activity {
 
             bar = new Ui.Bar(c);
             bar.setVisibility(GONE);
-            box.addView(bar, new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, Ui.u(0.3f), Gravity.BOTTOM));
+            FrameLayout.LayoutParams bl = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, Math.max(2, Ui.u(0.3f)), Gravity.BOTTOM);
+            bl.bottomMargin = Ui.u(0.1f);
+            box.addView(bar, bl);
             addView(box, new LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
         }
 
@@ -368,7 +541,7 @@ public final class HomeActivity extends Activity {
         }
     }
 
-    // ---- apps ---------------------------------------------------------------------------
+    // ---- apps ---------------------------------------------------------------------------------
 
     private void loadApps() {
         if (loadingApps) return;
@@ -380,39 +553,44 @@ public final class HomeActivity extends Activity {
             runOnUiThread(() -> {
                 loadingApps = false;
                 shownAppsRev = rev;
-                populate(items);
+                allItems = items;
+                populate();
             });
         }).start();
     }
 
-    private void populate(List<Apps.Item> all) {
-        int cols = Math.max(3, Math.min(8, Prefs.cols(this)));
+    private void populate() {
+        cols = Math.max(3, Math.min(8, Themes.cols(this, theme)));
+        dockCount = Math.min(theme.dock, cols);
         Set<String> hidden = Prefs.hidden(this);
         List<Apps.Item> visible = new ArrayList<>();
-        for (Apps.Item it : all) if (!hidden.contains(it.pkg)) visible.add(it);
-        List<Apps.Item> dock = Apps.pickDock(this, visible, cols);
-        List<Apps.Item> rest = new ArrayList<>(visible);
-        rest.removeAll(dock);
+        for (Apps.Item it : allItems) if (!hidden.contains(it.pkg)) visible.add(it);
+        visibleOrdered = Apps.ordered(this, visible);
 
         float gap = 1.1f;
         float tileW = (90f - gap * (cols - 1)) / cols;
         int w = Ui.u(tileW), h = Math.round(w * 9f / 16f), g = Ui.u(gap);
 
-        boolean hadFocus = dockRow.hasFocus() || gridBox.hasFocus();
+        View focused = getCurrentFocus();
+        boolean hadFocus = focused != null && (dockRow.hasFocus() || gridBox.hasFocus());
         dockRow.removeAllViews();
         gridBox.removeAllViews();
-        for (Apps.Item it : dock) addTile(dockRow, it, w, h, g);
-        for (int i = 0; i < rest.size(); i += cols) {
+        tileByPkg.clear();
+        int n = visibleOrdered.size();
+        for (int i = 0; i < Math.min(dockCount, n); i++) addTile(dockRow, visibleOrdered.get(i), w, h, g);
+        for (int i = dockCount; i < n; i += cols) {
             LinearLayout row = new LinearLayout(this);
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.setClipChildren(false);
-            for (int j = i; j < Math.min(rest.size(), i + cols); j++) addTile(row, rest.get(j), w, h, g);
+            for (int j = i; j < Math.min(n, i + cols); j++) addTile(row, visibleOrdered.get(j), w, h, g);
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             lp.bottomMargin = g;
             gridBox.addView(row, lp);
         }
-        if (!hadFocus && dockRow.getChildCount() > 0 && getCurrentFocus() == null) {
+        if (movingPkg != null && tileByPkg.get(movingPkg) != null) {
+            tileByPkg.get(movingPkg).requestFocus();
+        } else if (!hadFocus && dockRow.getChildCount() > 0 && getCurrentFocus() == null) {
             dockRow.getChildAt(0).requestFocus();
         }
     }
@@ -420,13 +598,16 @@ public final class HomeActivity extends Activity {
     private void addTile(LinearLayout row, Apps.Item it, int w, int h, int gap) {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(w, h);
         lp.setMarginEnd(gap);
-        row.addView(appTile(it), lp);
+        View t = appTile(it);
+        tileByPkg.put(it.pkg, t);
+        row.addView(t, lp);
     }
 
     private View appTile(final Apps.Item it) {
         FrameLayout f = new FrameLayout(this);
         f.setFocusable(true);
         f.setClickable(true);
+        f.setLongClickable(true);
         f.setBackground(Ui.solid(Color.rgb(38, 44, 58), 1.1f));
         f.setForeground(Ui.focusRing(1.1f));
         f.setClipToOutline(true);
@@ -452,7 +633,13 @@ public final class HomeActivity extends Activity {
         }
         f.setOnFocusChangeListener((v, focused) -> {
             Ui.focusAnim(v, focused, reduce);
-            if (focused) nameView.setText(it.label);
+            if (focused) {
+                nameView.setText(it.label);
+                setGlow(it.color);
+            }
+            if (Build.VERSION.SDK_INT >= 28 && theme.appGlow) {
+                v.setOutlineSpotShadowColor(focused ? it.color : Color.BLACK);
+            }
         });
         f.setOnClickListener(v -> {
             try {
@@ -461,6 +648,64 @@ public final class HomeActivity extends Activity {
                 Toast.makeText(this, R.string.cannot_open, Toast.LENGTH_SHORT).show();
             }
         });
+        f.setOnLongClickListener(v -> {
+            if (!Prefs.tileMenu(this)) return false;
+            showTileMenu(it);
+            return true;
+        });
         return f;
+    }
+
+    // ---- hold OK on an app: the tile menu -----------------------------------------------------
+
+    private void showTileMenu(final Apps.Item it) {
+        String[] items = {getString(R.string.tile_move), getString(R.string.tile_clear),
+                getString(R.string.tile_uninstall), getString(R.string.tile_hide)};
+        Dialogs.menu(this, it.label, items, which -> {
+            switch (which) {
+                case 0:
+                    movingPkg = it.pkg;
+                    Toast.makeText(this, R.string.move_hint, Toast.LENGTH_LONG).show();
+                    break;
+                case 1:
+                    Toast.makeText(this, R.string.clear_hint, Toast.LENGTH_LONG).show();
+                    open(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + it.pkg)));
+                    break;
+                case 2:
+                    open(new Intent(Intent.ACTION_DELETE, Uri.parse("package:" + it.pkg)));
+                    break;
+                default:
+                    Set<String> hidden = Prefs.hidden(this);
+                    hidden.add(it.pkg);
+                    Prefs.hidden(this, hidden);
+                    populate();
+                    break;
+            }
+        });
+    }
+
+    /** Moves the app being dragged one place (dx) or one row (dy) and keeps it focused. */
+    private void moveApp(int dx, int dy) {
+        int i = -1;
+        for (int k = 0; k < visibleOrdered.size(); k++) if (visibleOrdered.get(k).pkg.equals(movingPkg)) i = k;
+        if (i < 0) return;
+        int n = visibleOrdered.size(), target = i + dx;
+        if (dy > 0) target = i < dockCount ? dockCount + Math.min(i, cols - 1) : i + cols;
+        if (dy < 0) {
+            if (i >= dockCount) {
+                int r = (i - dockCount) / cols, col = (i - dockCount) % cols;
+                target = r == 0 ? Math.min(col, dockCount - 1) : i - cols;
+            } else {
+                target = i;
+            }
+        }
+        target = Math.max(0, Math.min(n - 1, target));
+        if (target == i) return;
+        Apps.Item item = visibleOrdered.remove(i);
+        visibleOrdered.add(target, item);
+        List<String> order = new ArrayList<>();
+        for (Apps.Item a : visibleOrdered) order.add(a.pkg);
+        Prefs.order(this, order);
+        populate();
     }
 }

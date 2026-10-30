@@ -136,8 +136,8 @@ final class Sources {
             Locale loc = LocaleHelper.numLocale(c);
             for (int i = 1; i < days.length(); i++) {
                 String day = LocalDate.parse(days.getString(i)).getDayOfWeek().getDisplayName(TextStyle.FULL, loc);
-                k.lines.add(day + ": " + condition(c, codes.getInt(i)) + ", "
-                        + Math.round(hi.getDouble(i)) + "\u00B0 / " + Math.round(lo.getDouble(i)) + "\u00B0");
+                k.items.add(new String[]{day, Math.round(hi.getDouble(i)) + "\u00B0",
+                        "/ " + Math.round(lo.getDouble(i)) + "\u00B0  " + condition(c, codes.getInt(i))});
             }
             k.updated = r.at;
             k.offline = r.offline;
@@ -214,9 +214,8 @@ final class Sources {
             } catch (Exception ignored) {
                 // the Hijri date is optional
             }
-            for (int i = 0; i < 6; i++) {
-                k.lines.add((i == next ? "\u25B6 " : "    ") + c.getString(NAMES[i]) + "   " + hhmm(times[i]));
-            }
+            for (int i = 0; i < 6; i++) k.items.add(new String[]{c.getString(NAMES[i]), hhmm(times[i]), ""});
+            k.highlight = next;
             k.updated = r.at;
             k.offline = r.offline;
             return k;
@@ -293,7 +292,10 @@ final class Sources {
                 StringBuilder target = i < 2 ? first : second;
                 if (target.length() > 0) target.append(" \u00B7 ");
                 target.append(part);
-                k.lines.add(part);
+            }
+            k.items.add(new String[]{c.getString(R.string.clock_local), hhmm(ZonedDateTime.now().toLocalTime()), ""});
+            for (int i = 0; i < ZONES.length; i++) {
+                k.items.add(new String[]{c.getString(NAMES[i]), hhmm(ZonedDateTime.now(ZoneId.of(ZONES[i])).toLocalTime()), ""});
             }
             k.sub = first.toString();
             k.detail = second.toString();
@@ -368,7 +370,7 @@ final class Sources {
             return k;
         }
 
-        private static String localIp() {
+        static String localIp() {
             try {
                 Enumeration<NetworkInterface> ifs = NetworkInterface.getNetworkInterfaces();
                 if (ifs == null) return "";
@@ -424,6 +426,38 @@ final class Sources {
             k.progress = 1f - (float) left / total;
             k.lines.add(c.getString(R.string.sb_line, n(hours)));
             return k;
+        }
+    }
+
+    // ---- remote access: is network debugging (ADB) open on this device? --------------------
+
+    static final class Remote implements Source {
+        @Override public String id() { return "remote"; }
+        @Override public int titleRes() { return R.string.card_remote; }
+        @Override public int accent() { return 0xFFF97316; }
+
+        @Override
+        public Card build(Context c, boolean fetch) {
+            Card k = base(c, this);
+            boolean adb = android.provider.Settings.Global.getInt(c.getContentResolver(),
+                    android.provider.Settings.Global.ADB_ENABLED, 0) == 1;
+            boolean open = portOpen(5555);
+            String ip = Network.localIp();
+            k.big = c.getString(open ? R.string.on : R.string.off);
+            k.sub = c.getString(open ? R.string.rm_open : adb ? R.string.rm_usb : R.string.rm_off);
+            k.detail = open && !ip.isEmpty() ? ip + ":5555" : c.getString(R.string.rm_hint);
+            if (open) k.badge = c.getString(R.string.rm_badge);
+            k.lines.add(c.getString(R.string.rm_explain));
+            return k;
+        }
+
+        private static boolean portOpen(int port) {
+            try (java.net.Socket s = new java.net.Socket()) {
+                s.connect(new java.net.InetSocketAddress("127.0.0.1", port), 300);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
         }
     }
 }

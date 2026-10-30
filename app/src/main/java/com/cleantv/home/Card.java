@@ -11,4 +11,6 @@ final class Card {
     long updated;              // when the underlying data was fetched
     boolean offline;           // showing saved data because the network failed
     final List<String> lines = new ArrayList<>();   // extra rows for the detail screen
+    final List<String[]> items = new ArrayList<>(); // boxes for the detail screen: {title, big, small}
+    int highlight = -1;                             // which box is the "next" one
 }

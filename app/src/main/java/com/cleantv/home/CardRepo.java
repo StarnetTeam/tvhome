@@ -15,7 +15,7 @@ final class CardRepo {
 
     static final List<Source> SOURCES = Arrays.<Source>asList(
             new Sources.Weather(), new Sources.Prayer(), new Sources.Matches(), new Sources.Clock(),
-            new Sources.Storage(), new Sources.Network(), new Sources.Standby());
+            new Sources.Storage(), new Sources.Network(), new Sources.Standby(), new Sources.Remote());
 
     private static final ExecutorService IO = Executors.newFixedThreadPool(2);
     private static final Handler UI = new Handler(Looper.getMainLooper());

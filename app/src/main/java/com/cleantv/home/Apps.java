@@ -4,6 +4,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
 import android.graphics.drawable.Drawable;
 
 import java.util.ArrayList;
@@ -21,9 +24,10 @@ final class Apps {
         Intent intent;
         Drawable image;
         boolean banner;
+        int color = 0xFFFFFFFF;   // average colour of the picture, used for the focus glow
     }
 
-    /** Streaming apps that go in the dock first when they are installed. */
+    /** Streaming apps that come first in the default order when they are installed. */
     private static final List<String> PREFERRED = Arrays.asList(
             "com.google.android.youtube.tv", "com.netflix.ninja", "com.amazon.amazonvideo.livingroom",
             "com.disney.disneyplus", "com.apple.atve.androidtv.appletv", "com.google.android.youtube",
@@ -52,6 +56,7 @@ final class Apps {
                     if (b == null) b = ri.activityInfo.applicationInfo.loadBanner(pm);
                     it.banner = b != null;
                     it.image = b != null ? b : ri.loadIcon(pm);
+                    it.color = averageColor(it.image);
                 }
                 found.put(pkg, it);
             }
@@ -63,28 +68,53 @@ final class Apps {
         return out;
     }
 
-    /** The user's pinned apps first, then well-known streaming apps, then alphabetical. */
-    static List<Item> pickDock(Context c, List<Item> visible, int size) {
-        List<Item> dock = new ArrayList<>();
-        for (String pkg : Prefs.dock(c)) {
-            Item it = find(visible, pkg);
-            if (it != null && !dock.contains(it) && dock.size() < size) dock.add(it);
+    /** The user's order if they moved apps, otherwise streaming apps first and then A to Z. */
+    static List<Item> ordered(Context c, List<Item> alphabetical) {
+        List<Item> byDefault = new ArrayList<>();
+        for (String pkg : PREFERRED) {
+            Item it = find(alphabetical, pkg);
+            if (it != null) byDefault.add(it);
         }
-        if (dock.isEmpty()) {
-            for (String pkg : PREFERRED) {
-                Item it = find(visible, pkg);
-                if (it != null && dock.size() < Math.min(4, size)) dock.add(it);
-            }
-            for (Item it : visible) {
-                if (dock.size() >= Math.min(4, size)) break;
-                if (!dock.contains(it)) dock.add(it);
-            }
+        for (Item it : alphabetical) if (!byDefault.contains(it)) byDefault.add(it);
+        List<String> saved = Prefs.order(c);
+        if (saved.isEmpty()) return byDefault;
+        List<Item> out = new ArrayList<>();
+        for (String pkg : saved) {
+            Item it = find(byDefault, pkg);
+            if (it != null && !out.contains(it)) out.add(it);
         }
-        return dock;
+        for (Item it : byDefault) if (!out.contains(it)) out.add(it);
+        return out;
     }
 
     private static Item find(List<Item> list, String pkg) {
         for (Item it : list) if (it.pkg.equals(pkg)) return it;
         return null;
+    }
+
+    /** Average of the visible pixels of a small copy of the picture; falls back to white. */
+    private static int averageColor(Drawable d) {
+        try {
+            Bitmap bm = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888);
+            Canvas cv = new Canvas(bm);
+            d.setBounds(0, 0, 8, 8);
+            d.draw(cv);
+            long r = 0, g = 0, b = 0, n = 0;
+            for (int y = 0; y < 8; y++) {
+                for (int x = 0; x < 8; x++) {
+                    int p = bm.getPixel(x, y);
+                    if (Color.alpha(p) < 128) continue;
+                    r += Color.red(p); g += Color.green(p); b += Color.blue(p); n++;
+                }
+            }
+            if (n == 0) return 0xFFFFFFFF;
+            int cr = (int) (r / n), cg = (int) (g / n), cb = (int) (b / n);
+            // keep it bright enough to read as light
+            int max = Math.max(cr, Math.max(cg, cb));
+            if (max < 110) { cr += 110 - max; cg += 110 - max; cb += 110 - max; }
+            return Color.rgb(Math.min(255, cr), Math.min(255, cg), Math.min(255, cb));
+        } catch (RuntimeException e) {
+            return 0xFFFFFFFF;
+        }
     }
 }
